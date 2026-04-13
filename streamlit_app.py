@@ -4,25 +4,17 @@ import google.generativeai as genai
 from streamlit_gsheets import GSheetsConnection
 import io
 
-# 1. 페이지 및 레이아웃 설정
+# 1. 페이지 설정
 st.set_page_config(page_title="KTDB Report Agent", layout="wide")
 
-# [수정] 모델 호출 방식 변경 (404 NotFound 해결)
+# 모델 초기화 (안정적인 모델 자동 선택)
 try:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    
-    # v1beta 등 특정 버전에서 발생할 수 있는 경로 문제를 해결하기 위해 
-    # 모델 리스트에서 사용 가능한 첫 번째 텍스트 생성 모델을 자동으로 선택합니다.
     available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-    
-    if available_models:
-        # 가장 성능이 좋은 1.5-flash나 1.5-pro를 우선 찾고 없으면 첫 번째 선택
-        target_model_name = next((m for m in available_models if "1.5-flash" in m), available_models[0])
-        model = genai.GenerativeModel(target_model_name)
-    else:
-        st.error("사용 가능한 Gemini 모델을 찾을 수 없습니다. API 키를 확인해주세요.")
+    target_model = next((m for m in available_models if "1.5-flash" in m), available_models[0])
+    model = genai.GenerativeModel(target_model)
 except Exception as e:
-    st.error(f"❌ AI 모델 초기화 실패: {e}")
+    st.error(f"AI 모델 초기화 실패: {e}")
 
 # 데이터 연결
 conn = st.connection("gsheets", type=GSheetsConnection)
@@ -33,71 +25,109 @@ if "messages" not in st.session_state:
 # 2. 사이드바 (분석 조건 설정)
 with st.sidebar:
     st.title("⚙️ 분석 조건 설정")
-    sido_select = st.selectbox("시도", ["전체", "서울특별시", "부산광역시", "대구광역시", "인천광역시", "광주광역시", "대전광역시", "울산광역시", "세종특별자치시", "경기도", "강원특별자치도", "충청북도", "충청남도", "전북특별자치도", "전라남도", "경상북도", "경상남도", "제주특별자치도"])
-    sigu_select = st.text_input("시군구 (선택)")
+    sido_select = st.selectbox("시도 선택", ["전체", "서울특별시", "부산광역시", "대구광역시", "인천광역시", "광주광역시", "대전광역시", "울산광역시", "세종특별자치시", "경기도", "강원특별자치도", "충청북도", "충청남도", "전북특별자치도", "전라남도", "경상북도", "경상남도", "제주특별자치도"])
+    sigu_select = st.text_input("시군구 입력 (선택)")
+    
+    st.divider()
+    st.subheader("📅 연도 설정")
     year_base = st.text_input("기준연도", value="2023")
     year_final = st.text_input("최종연도", value="2050")
+    
     if st.button("대화 초기화"):
         st.session_state.messages = []
         st.rerun()
 
 st.title("🚦 KTDB 통합 분석 Report Agent")
 
-# 3. 데이터 로직 (400 에러 방지를 위한 직접 URL 접근)
-def get_data(user_query):
-    # 질문에 따라 탭 이름 결정
-    tab_name = "POP_TOT" # 기본값
-    if "종사자" in user_query: tab_name = "WORK_TOT"
-    elif "취업자" in user_query: tab_name = "EMP"
-    elif "학생" in user_query: tab_name = "STU"
+# 3. 지능형 데이터 로드 함수 (모든 시트 파일 및 탭 대응)
+def fetch_ktdb_integrated_data(query):
+    # 키워드 기반 파일 및 탭 자동 매칭 로직
+    # A. 사회경제지표
+    if any(k in query for k in ["인구", "취업자", "학생", "종사자", "사회경제"]):
+        url = st.secrets["SHEET_URL_SOCIO"]
+        if "인구" in query: tab = "POP_TOT"
+        elif "종사자" in query: tab = "WORK_TOT"
+        elif "취업자" in query: tab = "EMP"
+        elif "학생" in query: tab = "STU"
+        elif "24세" in query: tab = "POP_YNG"
+        elif "15세" in query: tab = "POP_15P"
+        else: tab = "ZONE"
+        
+    # B. 목적 OD (PUR_연도)
+    elif "목적" in query or "출근" in query or "등교" in query:
+        url = st.secrets["SHEET_URL_OBJ_OD"]
+        # 질문에서 연도 추출 (없으면 기준연도)
+        target_year = next((y for y in ["2023", "2025", "2030", "2035", "2040", "2045", "2050"] if y in query), "2023")
+        tab = f"PUR_{target_year}"
+        
+    # C. 주수단 OD (MOD_연도)
+    elif "수단" in query or "승용차" in query or "버스" in query or "철도" in query:
+        url = st.secrets["SHEET_URL_MAIN_OD"]
+        target_year = next((y for y in ["2023", "2025", "2030", "2035", "2040", "2045", "2050"] if y in query), "2023")
+        tab = f"MOD_{target_year}"
+        
+    # D. 접근수단 OD
+    elif "접근" in query:
+        url = st.secrets["SHEET_URL_ACC_OD"]
+        tab = "ATTMOD_2023"
     
-    # 구글 시트 URL (Secrets에서 가져옴)
-    url = st.secrets["SHEET_URL_SOCIO"]
-    
-    # [중요] 400 에러 발생 시 시도할 보조 로직: 
-    # worksheet를 지정하지 않고 읽은 뒤 파이썬에서 탭 필터링
-    try:
-        return conn.read(spreadsheet=url, worksheet=tab_name, ttl=0), tab_name
-    except:
-        # 탭 이름을 못 찾을 경우 전체 시트를 로드 시도
-        return conn.read(spreadsheet=url, ttl=0), "기본탭"
+    else:
+        # 기본값: 사회경제지표 ZONE
+        url = st.secrets["SHEET_URL_SOCIO"]
+        tab = "ZONE"
 
-# AI 규칙
+    try:
+        df = conn.read(spreadsheet=url, worksheet=tab, ttl=0)
+        return df, tab
+    except Exception as e:
+        # 탭 이름을 못 찾을 경우 첫 번째 시트라도 반환
+        return conn.read(spreadsheet=url, ttl=0), "기본 탭"
+
+# AI 보고서 작성 규칙
 SCHEMA_RULES = """
-당신은 KTDB 전문 분석가입니다. 반드시 [실제 데이터] 수치로만 답하세요.
-1. 모든 표는 '존번호(ZONE)' 오름차순 정렬.
-2. 2023년은 실측 기준연도임.
-3. 결과는 요약 텍스트 후 CSV 블록(```csv ... ```)으로 생성.
-4. 모든 헤더는 한글로 변환.
+당신은 KTDB 전문 분석가입니다.
+- 제공된 [실제 데이터] 수치를 기반으로만 분석 보고서를 작성하세요.
+- 모든 데이터 표는 '존번호(ZONE)' 또는 발생존(ORGN) 기준 오름차순으로 정렬하세요.
+- 헤더 명칭은 반드시 한글화(시도, 시군구, 존번호, 인구수, 출근, 승용차 등)하세요.
+- 연도별 추세 요청 시 데이터에 없는 연도는 선형보간법을 적용하고 주석을 다세요.
+- 출력: 요약 텍스트 후 CSV 블록(```csv ... ```) 필수 생성.
 """
 
-# 대화 로그 출력
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if "df" in msg: st.dataframe(msg["df"], use_container_width=True)
 
-# 4. 질문 처리
-if user_input := st.chat_input("질문을 입력하세요..."):
+# 4. 통합 질문 처리
+if user_input := st.chat_input("인구, 종사자 또는 수단별 OD에 대해 질문하세요..."):
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"): st.markdown(user_input)
 
     with st.chat_message("assistant"):
-        with st.spinner("데이터 분석 중..."):
+        with st.spinner("통합 시트를 검색하여 데이터를 로드 중입니다..."):
             try:
-                df, used_tab = get_data(user_input)
+                df, used_tab = fetch_ktdb_integrated_data(user_input)
                 
-                # 데이터 필터링
-                if sido_select != "전체":
-                    df = df[df['SIDO'].astype(str).str.contains(sido_select, na=False)]
+                # 전처리 (지역 필터링 및 정렬)
+                working_df = df.copy()
                 
-                if 'ZONE' in df.columns:
-                    df['ZONE'] = pd.to_numeric(df['ZONE'], errors='coerce')
-                    df = df.sort_values(by='ZONE').dropna(subset=['ZONE'])
+                # SIDO 필터 (사회경제지표용)
+                if 'SIDO' in working_df.columns and sido_select != "전체":
+                    working_df = working_df[working_df['SIDO'].astype(str).str.contains(sido_select, na=False)]
+                
+                # ZONE 정렬 (사회경제지표)
+                if 'ZONE' in working_df.columns:
+                    working_df['ZONE'] = pd.to_numeric(working_df['ZONE'], errors='coerce')
+                    working_df = working_df.sort_values(by='ZONE').dropna(subset=['ZONE'])
+                
+                # ORGN 정렬 (OD 데이터용)
+                elif 'ORGN' in working_df.columns:
+                    working_df['ORGN'] = pd.to_numeric(working_df['ORGN'], errors='coerce')
+                    working_df = working_df.sort_values(by='ORGN').dropna(subset=['ORGN'])
 
-                # AI에게 데이터 전달
-                data_sample = df.head(50).to_string(index=False)
-                prompt = f"{SCHEMA_RULES}\n\n[실제 데이터 (탭: {used_tab})]\n{data_sample}\n\n질문: {user_input}"
+                # AI 프롬프트 구성
+                data_sample = working_df.head(100).to_string(index=False)
+                prompt = f"{SCHEMA_RULES}\n\n[실제 데이터 (탭: {used_tab})]\n컬럼: {list(working_df.columns)}\n데이터내용:\n{data_sample}\n\n질문: {user_input}"
                 
                 response = model.generate_content(prompt)
                 
@@ -115,4 +145,4 @@ if user_input := st.chat_input("질문을 입력하세요..."):
                 st.session_state.messages.append(new_msg)
                 
             except Exception as e:
-                st.error(f"❌ 분석 실패: {e}")
+                st.error(f"❌ 통합 분석 오류: {e}")
