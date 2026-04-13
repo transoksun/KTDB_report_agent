@@ -46,7 +46,7 @@ with st.sidebar:
 # ==========================================
 st.title("🚦 KTDB 통합 분석 Report Agent")
 
-# 데이터 시트 매핑 (Secrets에 저장된 URL 사용)
+# 데이터 시트 매핑
 SHEET_URLS = {
     "사회경제": st.secrets["SHEET_URL_SOCIO"],
     "목적OD": st.secrets["SHEET_URL_OBJ_OD"],
@@ -54,14 +54,16 @@ SHEET_URLS = {
     "접근수단OD": st.secrets["SHEET_URL_ACC_OD"]
 }
 
-# AI 분석 규칙 (수정: 보간법 및 데이터 출처 명확화)
+# AI 분석 규칙 (정확성 강화)
 SCHEMA_RULES = """
-당신은 KTDB 전문 분석가입니다. 반드시 전달된 [실제 데이터 샘플]에 기반하여 답변하세요.
-1. 데이터 출처: 배포된 자료는 2023(현황), 2025, 2030, 2035, 2040, 2045, 2050(장래)입니다.
-2. 절대 금기: 존재하지 않는 '2020년 실측' 등의 허구 데이터를 생성하지 마세요. 2023년은 기준연도 데이터이지 보간된 값이 아닙니다.
-3. 보간법: 2023, 2025, 2030, 2035, 2040, 2045, 2050 '사이'의 연도(예: 2027년) 요청 시에만 선형 보간법을 적용하세요.
-4. 용어: 행정구역(시도/시군구/존번호), 총 인구수, 종사자수 등 공식 한글 명칭만 사용하세요.
-5. 출력: 요약 텍스트 후 반드시 CSV 블록(```csv ... ```)을 포함하여 표를 생성하세요.
+당신은 KTDB 전문 분석가입니다. 반드시 전달된 [실제 데이터]를 기반으로만 답변하세요.
+
+[데이터 규칙]
+1. 배포 연도: 2023(현황), 2025, 2030, 2035, 2040, 2045, 2050입니다. 
+2. 팩트 체크: 2020년 데이터는 존재하지 않습니다. 2023년은 기준연도 실측값이므로 절대 '보간법으로 추정했다'고 말하지 마세요.
+3. 보간법 적용: 요청 연도가 배포 연도 사이(예: 2027년)일 때만 선형 보간을 수행하세요.
+4. 용어: 행정구역(시도/시군구/존번호), 총 인구수, 종사자수 등 한글 명칭만 사용하세요.
+5. 표 형식: 요약 텍스트 후 반드시 CSV 블록(```csv ... ```)을 생성하세요. 헤더는 '계층형'으로 만드세요.
 """
 
 # 과거 대화 출력
@@ -73,37 +75,3 @@ for message in st.session_state.messages:
 
 # 새로운 질문 입력
 if user_input := st.chat_input("질문을 입력하세요..."):
-    st.session_state.messages.append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
-        st.markdown(user_input)
-
-    with st.chat_message("assistant"):
-        with st.spinner("실제 구글 시트 데이터를 읽고 분석 중입니다..."):
-            try:
-                # 1. 사용자의 질문 의도에 따라 사회경제지표 시트를 먼저 읽어옴 (인구 질문이 많으므로)
-                # 실제 환경에서는 질문 키워드에 따라 시트를 선택적으로 로드함
-                raw_df = conn.read(spreadsheet=SHEET_URLS["사회경제"])
-                
-                # 2. 지역 필터링 (Python에서 먼저 필터링하여 AI에게 전달)
-                filtered_df = raw_df.copy()
-                if sido_select != "전체":
-                    filtered_df = filtered_df[filtered_df['SIDO'].str.contains(sido_select, na=False)]
-                if sigu_select:
-                    filtered_df = filtered_df[filtered_df['SIGU'].str.contains(sigu_select, na=False)]
-                
-                # 3. 데이터 샘플 준비 (AI에게 실제 값을 보여줌)
-                data_context = f"""
-                [실제 데이터 정보]
-                - 시트명: 사회경제지표 (POP_TOT 시트 등 통합)
-                - 데이터 샘플(상위 50행):
-                {filtered_df.head(50).to_string()}
-                
-                [현재 필터] 지역: {sido_select} {sigu_select}, 연도 범위: {year_base}~{year_final}
-                """
-                
-                # 4. AI에게 전달 및 응답 생성
-                response = model.generate_content(SCHEMA_RULES + "\n\n" + data_context + "\n\n질문: " + user_input)
-                full_response = response.text
-                
-                summary = full_response.split("```csv")[0]
-                st
