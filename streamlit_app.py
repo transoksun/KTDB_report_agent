@@ -4,11 +4,11 @@ from streamlit_gsheets import GSheetsConnection
 
 # 1. 페이지 설정
 st.set_page_config(page_title="KTDB Report Agent", layout="wide")
-st.title("🚦 KTDB Report Agent (Gemini)")
+st.title("🚦 KTDB Report Agent")
 
 # 2. 제미나이 AI 설정 (Secrets에서 키 가져오기)
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-3-flash-preview')
 
 # 3. 데이터베이스(구글 시트) 연결
 conn = st.connection("gsheets", type=GSheetsConnection)
