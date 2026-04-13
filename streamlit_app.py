@@ -66,19 +66,14 @@ SHEET_CONFIG = {
     },
 }
 
-# 원본 컬럼코드 → 한글 공식 용어 매핑
 COL_KR = {
     "SIDO": "시도", "SIGU": "시군구", "ZONE": "존번호",
     "ORGN": "발생존", "DEST": "도착존",
-    # 사회경제
     "2023": "2023년", "2025": "2025년", "2030": "2030년",
     "2035": "2035년", "2040": "2040년", "2045": "2045년", "2050": "2050년",
-    # 목적OD
     "WORK": "출근", "SCHO": "등교", "BUSI": "업무", "HOME": "귀가", "OTHE": "기타",
-    # 수단OD
     "AUTO": "승용차", "OBUS": "버스", "SUBW": "지하철",
     "RAIL": "일반철도", "ERAI": "고속철도",
-    # 접근수단OD
     "ATT_AANT": "승용차(접근)", "ATT_OBUS": "버스(접근)",
 }
 
@@ -103,7 +98,7 @@ def load_sheet(secret_key: str, tab: str) -> pd.DataFrame:
     return df
 
 # ─────────────────────────────────────────────────────────────
-# 5. 시군구 목록 (ZONE 시트에서 동적 로드)
+# 5. 시군구 목록 동적 로드
 # ─────────────────────────────────────────────────────────────
 SIDO_LIST = [
     "전체", "서울특별시", "부산광역시", "대구광역시", "인천광역시",
@@ -127,9 +122,10 @@ def get_sigu_list(sido: str) -> list:
 # ─────────────────────────────────────────────────────────────
 for key, default in {
     "messages": [],
-    "sel_file": "사회경제지표",
-    "sel_tab": "POP_TOT",
+    "sel_file": None,   # None = 미선택
+    "sel_tab":  None,   # None = 미선택
     "transpose": False,
+    "manual_mode": False,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -141,43 +137,82 @@ with st.sidebar:
     st.title("⚙️ 분석 조건")
     st.caption("모든 항목은 선택사항입니다. 미입력 시 전체 데이터를 대상으로 분석합니다.")
 
+    # 지역
     st.subheader("📍 분석 대상 지역")
     sido_sel = st.selectbox("시도", SIDO_LIST)
     sigu_options = get_sigu_list(sido_sel)
     sigu_sel = st.selectbox("시군구", sigu_options)
 
     st.divider()
+
+    # 연도
     st.subheader("📅 분석 연도")
     st.caption("배포 연도(2023·2025·2030·2035·2040·2045·2050) 외 입력 시 보간법 적용")
-
-    year_base = st.text_input("기준연도", placeholder="예: 2023 (선택)")
-    
+    year_base  = st.text_input("기준연도",    placeholder="예: 2023  (선택)")
     col1, col2 = st.columns(2)
     with col1:
-        year_mid1 = st.text_input("중간목표①", placeholder="예: 2030",
-                                   label_visibility="visible",
-                                   help="선택 입력")
+        year_mid1 = st.text_input("중간목표①", placeholder="예: 2030")
     with col2:
-        year_mid2 = st.text_input("중간목표②", placeholder="예: 2040",
-                                   help="선택 입력")
-    year_mid3 = st.text_input("중간목표③ (선택)", placeholder="예: 2045")
-    year_final = st.text_input("최종목표연도", placeholder="예: 2050 (선택)")
+        year_mid2 = st.text_input("중간목표②", placeholder="예: 2040")
+    year_mid3  = st.text_input("중간목표③",   placeholder="예: 2045  (선택)")
+    year_final = st.text_input("최종목표연도", placeholder="예: 2050  (선택)")
 
     st.divider()
-    st.subheader("📂 시트 직접 선택")
-    st.caption("AI 자동 선택을 우선하나, 직접 지정도 가능합니다.")
 
-    file_opts = list(SHEET_CONFIG.keys())
-    sel_file = st.selectbox("파일", file_opts,
-                             index=file_opts.index(st.session_state.sel_file))
-    st.session_state.sel_file = sel_file
+    # 시트 선택 토글
+    st.subheader("📂 시트 선택")
+    manual_mode = st.toggle(
+        "직접 선택 (OFF = AI 자동)",
+        value=st.session_state.manual_mode,
+        help="OFF: 질문 내용에 따라 AI가 시트를 자동 선택합니다.\nON: 아래 드롭다운에서 직접 선택한 시트를 우선합니다."
+    )
+    st.session_state.manual_mode = manual_mode
 
-    tab_opts = list(SHEET_CONFIG[sel_file]["tabs"].keys())
-    tab_labels = [f"{k} — {v}" for k, v in SHEET_CONFIG[sel_file]["tabs"].items()]
-    tab_idx = tab_opts.index(st.session_state.sel_tab) if st.session_state.sel_tab in tab_opts else 0
-    sel_tab_display = st.selectbox("시트(탭)", tab_labels, index=tab_idx)
-    sel_tab = tab_opts[tab_labels.index(sel_tab_display)]
-    st.session_state.sel_tab = sel_tab
+    if manual_mode:
+        # 파일 선택 — 기본값 없음(placeholder)
+        file_opts   = list(SHEET_CONFIG.keys())
+        file_labels = ["— 파일을 선택하세요 —"] + file_opts
+
+        current_file_idx = (
+            file_labels.index(st.session_state.sel_file)
+            if st.session_state.sel_file in file_labels else 0
+        )
+        sel_file_label = st.selectbox("파일", file_labels, index=current_file_idx)
+
+        if sel_file_label == "— 파일을 선택하세요 —":
+            st.session_state.sel_file = None
+            st.session_state.sel_tab  = None
+            st.caption("⬆️ 파일을 먼저 선택하세요.")
+        else:
+            st.session_state.sel_file = sel_file_label
+
+            # 탭 선택 — 기본값 없음(placeholder)
+            tab_opts   = list(SHEET_CONFIG[sel_file_label]["tabs"].keys())
+            tab_labels = ["— 시트를 선택하세요 —"] + [
+                f"{k} — {v}" for k, v in SHEET_CONFIG[sel_file_label]["tabs"].items()
+            ]
+
+            current_tab_display = (
+                f"{st.session_state.sel_tab} — {SHEET_CONFIG[sel_file_label]['tabs'].get(st.session_state.sel_tab, '')}"
+                if st.session_state.sel_tab in tab_opts else "— 시트를 선택하세요 —"
+            )
+            current_tab_idx = (
+                tab_labels.index(current_tab_display)
+                if current_tab_display in tab_labels else 0
+            )
+            sel_tab_label = st.selectbox("시트(탭)", tab_labels, index=current_tab_idx)
+
+            if sel_tab_label == "— 시트를 선택하세요 —":
+                st.session_state.sel_tab = None
+                st.caption("⬆️ 시트를 선택하세요.")
+            else:
+                sel_tab = tab_opts[tab_labels.index(sel_tab_label) - 1]  # placeholder 오프셋
+                st.session_state.sel_tab = sel_tab
+                st.caption(f"✅ 고정: `{sel_file_label}` > `{sel_tab}`")
+    else:
+        st.caption("🤖 AI가 질문을 분석해 시트를 자동 선택합니다.")
+        if st.session_state.sel_file and st.session_state.sel_tab:
+            st.caption(f"마지막 선택: `{st.session_state.sel_file}` > `{st.session_state.sel_tab}`")
 
     st.divider()
     if st.button("🗑️ 대화 초기화"):
@@ -211,38 +246,33 @@ JSON 외 어떤 텍스트도 출력하지 마세요.
             return f, t
     except Exception:
         pass
-    return st.session_state.sel_file, st.session_state.sel_tab
+    # fallback: 첫 번째 파일·탭
+    fallback_file = list(SHEET_CONFIG.keys())[0]
+    fallback_tab  = list(SHEET_CONFIG[fallback_file]["tabs"].keys())[0]
+    return fallback_file, fallback_tab
 
 # ─────────────────────────────────────────────────────────────
-# 9. 전처리 (필터 + 정렬 + 한글 컬럼명)
+# 9. 전처리
 # ─────────────────────────────────────────────────────────────
-def preprocess(df: pd.DataFrame, file_label: str) -> pd.DataFrame:
+def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
-    # 지역 필터
     if "SIDO" in df.columns and sido_sel != "전체":
         df = df[df["SIDO"].astype(str).str.contains(sido_sel, na=False)]
     if "SIGU" in df.columns and sigu_sel != "전체":
         df = df[df["SIGU"].astype(str).str.contains(sigu_sel, na=False)]
-
-    # 정렬 기준
     sort_col = next((c for c in ["ZONE", "ORGN"] if c in df.columns), None)
     if sort_col:
         df[sort_col] = pd.to_numeric(df[sort_col], errors="coerce")
         df = df.sort_values(sort_col).dropna(subset=[sort_col])
-
-    # 컬럼 한글화
     df.rename(columns={c: COL_KR.get(c, c) for c in df.columns}, inplace=True)
-
     return df
 
 # ─────────────────────────────────────────────────────────────
-# 10. 보간법 처리
+# 10. 보간법
 # ─────────────────────────────────────────────────────────────
 DIST_YEARS = [int(y) for y in YEARS]
 
 def get_user_years() -> list[int]:
-    """사이드바에서 입력된 연도 수집"""
     raw = [year_base, year_mid1, year_mid2, year_mid3, year_final]
     result = []
     for y in raw:
@@ -252,18 +282,13 @@ def get_user_years() -> list[int]:
     return sorted(set(result)) if result else DIST_YEARS
 
 def interpolate_years(df: pd.DataFrame, target_years: list[int]) -> tuple[pd.DataFrame, list[int]]:
-    """목표연도가 배포연도 외이면 선형보간 컬럼 생성, 보간된 연도 목록 반환"""
     interp_years = []
-    year_cols = [c for c in df.columns if str(c).isdigit() or
-                 (isinstance(c, str) and c.replace("년","").strip().isdigit())]
-
     for y in target_years:
         col_name = f"{y}년"
         if col_name in df.columns:
             continue
         if y in DIST_YEARS:
             continue
-        # 선형보간
         lower = max([d for d in DIST_YEARS if d <= y], default=None)
         upper = min([d for d in DIST_YEARS if d >= y], default=None)
         if lower and upper and lower != upper:
@@ -278,20 +303,20 @@ def interpolate_years(df: pd.DataFrame, target_years: list[int]) -> tuple[pd.Dat
     return df, interp_years
 
 # ─────────────────────────────────────────────────────────────
-# 11. 멀티시트 통합 로드 (존번호 기준 병합)
+# 11. 통합 로드
 # ─────────────────────────────────────────────────────────────
 def load_integrated(file_label: str, tab: str,
                     target_years: list[int]) -> tuple[pd.DataFrame, list[int]]:
     secret = SHEET_CONFIG[file_label]["secret_key"]
     df = load_sheet(secret, tab)
-    df = preprocess(df, file_label)
+    df = preprocess(df)
     df, interp = interpolate_years(df, target_years)
     return df, interp
 
 # ─────────────────────────────────────────────────────────────
-# 12. AI 분석 프롬프트
+# 12. AI 분석 프롬프트 규칙
 # ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """당신은 KTDB 전문 분석가입니다. 규칙을 엄격히 따르세요.
+SYSTEM_PROMPT = """당신은 KTDB 전문 분석가입니다. 아래 규칙을 엄격히 따르세요.
 
 [출력 규칙]
 1. 설명은 2~3줄 이내 핵심 요약만 작성.
@@ -300,9 +325,9 @@ SYSTEM_PROMPT = """당신은 KTDB 전문 분석가입니다. 규칙을 엄격히
 4. 단위를 표 상단이나 헤더에 반드시 표기.
 5. 보간 연도가 있으면 해당 열 헤더에 *(보간) 주석 추가.
 6. 행정구역(시도·시군구·존번호) 컬럼은 고정, 나머지는 질문 내용에 따라 구성.
-7. 연도별 비교 요청 시: 상위 헤더=항목명, 하위 헤더=연도 / 항목별 비교 요청 시: 상위 헤더=연도, 하위 헤더=항목명.
+7. 연도별 비교: 상위 헤더=항목명, 하위 헤더=연도 / 항목별 비교: 상위 헤더=연도, 하위 헤더=항목명.
 8. 실제 데이터에 없는 수치를 절대 만들어내지 마세요.
-9. 출력: 요약 텍스트 → CSV 블록(```csv ... ```) 순.
+9. 출력 형식: 요약 텍스트 → CSV 블록(```csv ... ```) 순.
 """
 
 # ─────────────────────────────────────────────────────────────
@@ -316,24 +341,22 @@ for msg in st.session_state.messages:
         if "df" in msg:
             df_show = msg["df"].T if st.session_state.transpose else msg["df"]
             st.dataframe(df_show, use_container_width=True)
-            # 복사 버튼
             csv_str = msg["df"].to_csv(index=False, encoding="utf-8-sig")
-            st.download_button("📋 표 복사 (CSV 다운로드)",
-                               data=csv_str,
-                               file_name="ktdb_result.csv",
-                               mime="text/csv",
-                               key=f"dl_{id(msg)}")
+            st.download_button(
+                "📋 CSV 다운로드",
+                data=csv_str,
+                file_name="ktdb_result.csv",
+                mime="text/csv",
+                key=f"dl_{id(msg)}"
+            )
 
-# ─────────────────────────────────────────────────────────────
-# 14. 전치(행열 변환) 토글
-# ─────────────────────────────────────────────────────────────
 if any("df" in m for m in st.session_state.messages):
     st.session_state.transpose = st.toggle(
         "↔️ 행·열 전환", value=st.session_state.transpose
     )
 
 # ─────────────────────────────────────────────────────────────
-# 15. 질문 처리
+# 14. 질문 처리
 # ─────────────────────────────────────────────────────────────
 if user_input := st.chat_input("질문을 입력하세요 — 예: 경기도 2030년 인구수와 종사자수 비교"):
     st.session_state.messages.append({"role": "user", "content": user_input})
@@ -342,20 +365,27 @@ if user_input := st.chat_input("질문을 입력하세요 — 예: 경기도 203
 
     with st.chat_message("assistant"):
 
-        # ① AI 탭 라우팅
-        with st.spinner("AI가 적합한 시트를 선택 중..."):
-            ai_file, ai_tab = ai_route(user_input)
-            # 사이드바 상태 갱신
-            st.session_state.sel_file = ai_file
-            st.session_state.sel_tab  = ai_tab
-
-        tab_kr = SHEET_CONFIG[ai_file]["tabs"].get(ai_tab, ai_tab)
-        st.caption(f"📂 선택된 시트: **{ai_file}** > **{tab_kr}**")
+        # ① 시트 결정
+        if manual_mode and st.session_state.sel_file and st.session_state.sel_tab:
+            ai_file = st.session_state.sel_file
+            ai_tab  = st.session_state.sel_tab
+            tab_kr  = SHEET_CONFIG[ai_file]["tabs"].get(ai_tab, ai_tab)
+            st.caption(f"📂 직접 선택: **{ai_file}** > **{tab_kr}**")
+        elif manual_mode and (not st.session_state.sel_file or not st.session_state.sel_tab):
+            st.warning("직접 선택 모드입니다. 사이드바에서 파일과 시트를 선택해 주세요.")
+            st.stop()
+        else:
+            with st.spinner("AI가 적합한 시트를 선택 중..."):
+                ai_file, ai_tab = ai_route(user_input)
+                st.session_state.sel_file = ai_file
+                st.session_state.sel_tab  = ai_tab
+            tab_kr = SHEET_CONFIG[ai_file]["tabs"].get(ai_tab, ai_tab)
+            st.caption(f"📂 AI 자동 선택: **{ai_file}** > **{tab_kr}**")
 
         # ② 연도 결정
         target_years = get_user_years()
 
-        # ③ 데이터 로드 & 전처리
+        # ③ 데이터 로드
         with st.spinner(f"`{ai_tab}` 데이터 로딩 중..."):
             try:
                 df, interp_years = load_integrated(ai_file, ai_tab, target_years)
@@ -364,7 +394,10 @@ if user_input := st.chat_input("질문을 입력하세요 — 예: 경기도 203
                 st.stop()
 
         unit = UNITS.get(ai_file, "")
-        interp_note = f"\n※ 보간 연도: {interp_years} (선형보간법 적용)" if interp_years else ""
+        interp_note = (
+            f"\n※ 보간 연도: {interp_years} (선형보간법 적용)"
+            if interp_years else ""
+        )
 
         # ④ AI 분석
         data_sample = df.head(150).to_string(index=False)
@@ -381,30 +414,24 @@ if user_input := st.chat_input("질문을 입력하세요 — 예: 경기도 203
             response = model.generate_content(prompt)
 
         full_text = response.text
-
-        # ⑤ 요약 텍스트 출력
-        summary = full_text.split("```csv")[0].strip()
+        summary   = full_text.split("```csv")[0].strip()
         st.markdown(summary)
 
-        # ⑥ CSV 파싱 및 표 출력
         new_msg = {"role": "assistant", "content": summary}
 
         if "```csv" in full_text:
             csv_raw = full_text.split("```csv")[1].split("```")[0].strip()
             try:
-                res_df = pd.read_csv(io.StringIO(csv_raw))
-
-                # 행열 전환 토글 반영
+                res_df  = pd.read_csv(io.StringIO(csv_raw))
                 df_show = res_df.T if st.session_state.transpose else res_df
                 st.dataframe(df_show, use_container_width=True)
-
-                # 다운로드 버튼
-                csv_dl = res_df.to_csv(index=False, encoding="utf-8-sig")
-                st.download_button("📋 표 복사 (CSV 다운로드)",
-                                   data=csv_dl,
-                                   file_name="ktdb_result.csv",
-                                   mime="text/csv")
-
+                csv_dl  = res_df.to_csv(index=False, encoding="utf-8-sig")
+                st.download_button(
+                    "📋 CSV 다운로드",
+                    data=csv_dl,
+                    file_name="ktdb_result.csv",
+                    mime="text/csv"
+                )
                 new_msg["df"] = res_df
             except Exception:
                 st.warning("CSV 파싱 실패 — 텍스트 결과만 표시합니다.")
