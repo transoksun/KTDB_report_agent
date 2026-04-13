@@ -3,146 +3,410 @@ import pandas as pd
 import google.generativeai as genai
 from streamlit_gsheets import GSheetsConnection
 import io
+import json
 
+# ─────────────────────────────────────────────────────────────
 # 1. 페이지 설정
-st.set_page_config(page_title="KTDB Report Agent", layout="wide")
+# ─────────────────────────────────────────────────────────────
+st.set_page_config(page_title="KTDB 통합 분석 에이전트", layout="wide")
 
-# 모델 초기화 (안정적인 모델 자동 선택)
-try:
+st.markdown("""
+<style>
+thead tr th { background: #f0f2f6; font-weight: 600; }
+.stDataFrame { font-size: 13px; }
+</style>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────
+# 2. AI 모델 초기화
+# ─────────────────────────────────────────────────────────────
+@st.cache_resource
+def init_model():
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-    target_model = next((m for m in available_models if "1.5-flash" in m), available_models[0])
-    model = genai.GenerativeModel(target_model)
+    models = [m.name for m in genai.list_models()
+              if 'generateContent' in m.supported_generation_methods]
+    name = next((m for m in models if "1.5-flash" in m), models[0])
+    return genai.GenerativeModel(name)
+
+try:
+    model = init_model()
 except Exception as e:
     st.error(f"AI 모델 초기화 실패: {e}")
+    st.stop()
 
-# 데이터 연결
+# ─────────────────────────────────────────────────────────────
+# 3. 데이터 소스 정의
+# ─────────────────────────────────────────────────────────────
+YEARS = ["2023", "2025", "2030", "2035", "2040", "2045", "2050"]
+
+SHEET_CONFIG = {
+    "사회경제지표": {
+        "secret_key": "SHEET_URL_SOCIO",
+        "tabs": {
+            "ZONE":     "존체계(행정구역)",
+            "POP_TOT":  "총 인구수",
+            "POP_YNG":  "5-24세 인구수",
+            "POP_15P":  "15세이상 인구수",
+            "EMP":      "취업자수",
+            "STU":      "수용학생수",
+            "WORK_TOT": "종사자수",
+        }
+    },
+    "목적OD": {
+        "secret_key": "SHEET_URL_OBJ_OD",
+        "tabs": {f"PUR_{y}": f"목적OD ({y}년)" for y in YEARS}
+    },
+    "주수단OD": {
+        "secret_key": "SHEET_URL_MAIN_OD",
+        "tabs": {f"MOD_{y}": f"주수단OD ({y}년)" for y in YEARS}
+    },
+    "접근수단OD": {
+        "secret_key": "SHEET_URL_ACC_OD",
+        "tabs": {"ATTMOD_2023": "접근수단OD (2023년)"}
+    },
+}
+
+# 원본 컬럼코드 → 한글 공식 용어 매핑
+COL_KR = {
+    "SIDO": "시도", "SIGU": "시군구", "ZONE": "존번호",
+    "ORGN": "발생존", "DEST": "도착존",
+    # 사회경제
+    "2023": "2023년", "2025": "2025년", "2030": "2030년",
+    "2035": "2035년", "2040": "2040년", "2045": "2045년", "2050": "2050년",
+    # 목적OD
+    "WORK": "출근", "SCHO": "등교", "BUSI": "업무", "HOME": "귀가", "OTHE": "기타",
+    # 수단OD
+    "AUTO": "승용차", "OBUS": "버스", "SUBW": "지하철",
+    "RAIL": "일반철도", "ERAI": "고속철도",
+    # 접근수단OD
+    "ATT_AANT": "승용차(접근)", "ATT_OBUS": "버스(접근)",
+}
+
+UNITS = {
+    "사회경제지표": "명",
+    "목적OD": "통행/일",
+    "주수단OD": "통행/일",
+    "접근수단OD": "통행/일",
+}
+
+# ─────────────────────────────────────────────────────────────
+# 4. 구글 시트 연결
+# ─────────────────────────────────────────────────────────────
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+@st.cache_data(ttl=600, show_spinner=False)
+def load_sheet(secret_key: str, tab: str) -> pd.DataFrame:
+    url = st.secrets[secret_key]
+    df = conn.read(spreadsheet=url, worksheet=tab, ttl=0)
+    if df is None or df.empty:
+        raise ValueError(f"데이터 없음: {tab}")
+    return df
 
-# 2. 사이드바 (분석 조건 설정)
+# ─────────────────────────────────────────────────────────────
+# 5. 시군구 목록 (ZONE 시트에서 동적 로드)
+# ─────────────────────────────────────────────────────────────
+SIDO_LIST = [
+    "전체", "서울특별시", "부산광역시", "대구광역시", "인천광역시",
+    "광주광역시", "대전광역시", "울산광역시", "세종특별자치시", "경기도",
+    "강원특별자치도", "충청북도", "충청남도", "전북특별자치도", "전라남도",
+    "경상북도", "경상남도", "제주특별자치도"
+]
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_sigu_list(sido: str) -> list:
+    try:
+        df = load_sheet("SHEET_URL_SOCIO", "ZONE")
+        if sido != "전체":
+            df = df[df["SIDO"].astype(str).str.contains(sido, na=False)]
+        return ["전체"] + sorted(df["SIGU"].dropna().unique().tolist())
+    except Exception:
+        return ["전체"]
+
+# ─────────────────────────────────────────────────────────────
+# 6. 세션 상태 초기화
+# ─────────────────────────────────────────────────────────────
+for key, default in {
+    "messages": [],
+    "sel_file": "사회경제지표",
+    "sel_tab": "POP_TOT",
+    "transpose": False,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# ─────────────────────────────────────────────────────────────
+# 7. 사이드바
+# ─────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("⚙️ 분석 조건 설정")
-    sido_select = st.selectbox("시도 선택", ["전체", "서울특별시", "부산광역시", "대구광역시", "인천광역시", "광주광역시", "대전광역시", "울산광역시", "세종특별자치시", "경기도", "강원특별자치도", "충청북도", "충청남도", "전북특별자치도", "전라남도", "경상북도", "경상남도", "제주특별자치도"])
-    sigu_select = st.text_input("시군구 입력 (선택)")
-    
+    st.title("⚙️ 분석 조건")
+    st.caption("모든 항목은 선택사항입니다. 미입력 시 전체 데이터를 대상으로 분석합니다.")
+
+    st.subheader("📍 분석 대상 지역")
+    sido_sel = st.selectbox("시도", SIDO_LIST)
+    sigu_options = get_sigu_list(sido_sel)
+    sigu_sel = st.selectbox("시군구", sigu_options)
+
     st.divider()
-    st.subheader("📅 연도 설정")
-    year_base = st.text_input("기준연도", value="2023")
-    year_final = st.text_input("최종연도", value="2050")
+    st.subheader("📅 분석 연도")
+    st.caption("배포 연도(2023·2025·2030·2035·2040·2045·2050) 외 입력 시 보간법 적용")
+
+    year_base = st.text_input("기준연도", placeholder="예: 2023 (선택)")
     
-    if st.button("대화 초기화"):
+    col1, col2 = st.columns(2)
+    with col1:
+        year_mid1 = st.text_input("중간목표①", placeholder="예: 2030",
+                                   label_visibility="visible",
+                                   help="선택 입력")
+    with col2:
+        year_mid2 = st.text_input("중간목표②", placeholder="예: 2040",
+                                   help="선택 입력")
+    year_mid3 = st.text_input("중간목표③ (선택)", placeholder="예: 2045")
+    year_final = st.text_input("최종목표연도", placeholder="예: 2050 (선택)")
+
+    st.divider()
+    st.subheader("📂 시트 직접 선택")
+    st.caption("AI 자동 선택을 우선하나, 직접 지정도 가능합니다.")
+
+    file_opts = list(SHEET_CONFIG.keys())
+    sel_file = st.selectbox("파일", file_opts,
+                             index=file_opts.index(st.session_state.sel_file))
+    st.session_state.sel_file = sel_file
+
+    tab_opts = list(SHEET_CONFIG[sel_file]["tabs"].keys())
+    tab_labels = [f"{k} — {v}" for k, v in SHEET_CONFIG[sel_file]["tabs"].items()]
+    tab_idx = tab_opts.index(st.session_state.sel_tab) if st.session_state.sel_tab in tab_opts else 0
+    sel_tab_display = st.selectbox("시트(탭)", tab_labels, index=tab_idx)
+    sel_tab = tab_opts[tab_labels.index(sel_tab_display)]
+    st.session_state.sel_tab = sel_tab
+
+    st.divider()
+    if st.button("🗑️ 대화 초기화"):
         st.session_state.messages = []
         st.rerun()
 
-st.title("🚦 KTDB 통합 분석 Report Agent")
+# ─────────────────────────────────────────────────────────────
+# 8. AI 탭 자동 선택
+# ─────────────────────────────────────────────────────────────
+def ai_route(query: str) -> tuple[str, str]:
+    registry = {
+        fname: list(cfg["tabs"].keys())
+        for fname, cfg in SHEET_CONFIG.items()
+    }
+    prompt = f"""
+아래는 KTDB 시트 구성입니다.
+{json.dumps(registry, ensure_ascii=False)}
 
-# 3. 지능형 데이터 로드 함수 (모든 시트 파일 및 탭 대응)
-def fetch_ktdb_integrated_data(query):
-    # 키워드 기반 파일 및 탭 자동 매칭 로직
-    # A. 사회경제지표
-    if any(k in query for k in ["인구", "취업자", "학생", "종사자", "사회경제"]):
-        url = st.secrets["SHEET_URL_SOCIO"]
-        if "인구" in query: tab = "POP_TOT"
-        elif "종사자" in query: tab = "WORK_TOT"
-        elif "취업자" in query: tab = "EMP"
-        elif "학생" in query: tab = "STU"
-        elif "24세" in query: tab = "POP_YNG"
-        elif "15세" in query: tab = "POP_15P"
-        else: tab = "ZONE"
-        
-    # B. 목적 OD (PUR_연도)
-    elif "목적" in query or "출근" in query or "등교" in query:
-        url = st.secrets["SHEET_URL_OBJ_OD"]
-        # 질문에서 연도 추출 (없으면 기준연도)
-        target_year = next((y for y in ["2023", "2025", "2030", "2035", "2040", "2045", "2050"] if y in query), "2023")
-        tab = f"PUR_{target_year}"
-        
-    # C. 주수단 OD (MOD_연도)
-    elif "수단" in query or "승용차" in query or "버스" in query or "철도" in query:
-        url = st.secrets["SHEET_URL_MAIN_OD"]
-        target_year = next((y for y in ["2023", "2025", "2030", "2035", "2040", "2045", "2050"] if y in query), "2023")
-        tab = f"MOD_{target_year}"
-        
-    # D. 접근수단 OD
-    elif "접근" in query:
-        url = st.secrets["SHEET_URL_ACC_OD"]
-        tab = "ATTMOD_2023"
-    
-    else:
-        # 기본값: 사회경제지표 ZONE
-        url = st.secrets["SHEET_URL_SOCIO"]
-        tab = "ZONE"
+사용자 질문: "{query}"
 
-    try:
-        df = conn.read(spreadsheet=url, worksheet=tab, ttl=0)
-        return df, tab
-    except Exception as e:
-        # 탭 이름을 못 찾을 경우 첫 번째 시트라도 반환
-        return conn.read(spreadsheet=url, ttl=0), "기본 탭"
-
-# AI 보고서 작성 규칙
-SCHEMA_RULES = """
-당신은 KTDB 전문 분석가입니다.
-- 제공된 [실제 데이터] 수치를 기반으로만 분석 보고서를 작성하세요.
-- 모든 데이터 표는 '존번호(ZONE)' 또는 발생존(ORGN) 기준 오름차순으로 정렬하세요.
-- 헤더 명칭은 반드시 한글화(시도, 시군구, 존번호, 인구수, 출근, 승용차 등)하세요.
-- 연도별 추세 요청 시 데이터에 없는 연도는 선형보간법을 적용하고 주석을 다세요.
-- 출력: 요약 텍스트 후 CSV 블록(```csv ... ```) 필수 생성.
+가장 적합한 파일명과 탭명을 JSON으로만 반환하세요.
+예: {{"file": "사회경제지표", "tab": "POP_TOT"}}
+JSON 외 어떤 텍스트도 출력하지 마세요.
 """
+    try:
+        raw = model.generate_content(prompt).text.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        result = json.loads(raw)
+        f, t = result["file"], result["tab"]
+        if f in SHEET_CONFIG and t in SHEET_CONFIG[f]["tabs"]:
+            return f, t
+    except Exception:
+        pass
+    return st.session_state.sel_file, st.session_state.sel_tab
+
+# ─────────────────────────────────────────────────────────────
+# 9. 전처리 (필터 + 정렬 + 한글 컬럼명)
+# ─────────────────────────────────────────────────────────────
+def preprocess(df: pd.DataFrame, file_label: str) -> pd.DataFrame:
+    df = df.copy()
+
+    # 지역 필터
+    if "SIDO" in df.columns and sido_sel != "전체":
+        df = df[df["SIDO"].astype(str).str.contains(sido_sel, na=False)]
+    if "SIGU" in df.columns and sigu_sel != "전체":
+        df = df[df["SIGU"].astype(str).str.contains(sigu_sel, na=False)]
+
+    # 정렬 기준
+    sort_col = next((c for c in ["ZONE", "ORGN"] if c in df.columns), None)
+    if sort_col:
+        df[sort_col] = pd.to_numeric(df[sort_col], errors="coerce")
+        df = df.sort_values(sort_col).dropna(subset=[sort_col])
+
+    # 컬럼 한글화
+    df.rename(columns={c: COL_KR.get(c, c) for c in df.columns}, inplace=True)
+
+    return df
+
+# ─────────────────────────────────────────────────────────────
+# 10. 보간법 처리
+# ─────────────────────────────────────────────────────────────
+DIST_YEARS = [int(y) for y in YEARS]
+
+def get_user_years() -> list[int]:
+    """사이드바에서 입력된 연도 수집"""
+    raw = [year_base, year_mid1, year_mid2, year_mid3, year_final]
+    result = []
+    for y in raw:
+        y = y.strip() if y else ""
+        if y.isdigit():
+            result.append(int(y))
+    return sorted(set(result)) if result else DIST_YEARS
+
+def interpolate_years(df: pd.DataFrame, target_years: list[int]) -> tuple[pd.DataFrame, list[int]]:
+    """목표연도가 배포연도 외이면 선형보간 컬럼 생성, 보간된 연도 목록 반환"""
+    interp_years = []
+    year_cols = [c for c in df.columns if str(c).isdigit() or
+                 (isinstance(c, str) and c.replace("년","").strip().isdigit())]
+
+    for y in target_years:
+        col_name = f"{y}년"
+        if col_name in df.columns:
+            continue
+        if y in DIST_YEARS:
+            continue
+        # 선형보간
+        lower = max([d for d in DIST_YEARS if d <= y], default=None)
+        upper = min([d for d in DIST_YEARS if d >= y], default=None)
+        if lower and upper and lower != upper:
+            lc, uc = f"{lower}년", f"{upper}년"
+            if lc in df.columns and uc in df.columns:
+                ratio = (y - lower) / (upper - lower)
+                df[col_name] = (
+                    df[lc].astype(float) +
+                    ratio * (df[uc].astype(float) - df[lc].astype(float))
+                ).round(1)
+                interp_years.append(y)
+    return df, interp_years
+
+# ─────────────────────────────────────────────────────────────
+# 11. 멀티시트 통합 로드 (존번호 기준 병합)
+# ─────────────────────────────────────────────────────────────
+def load_integrated(file_label: str, tab: str,
+                    target_years: list[int]) -> tuple[pd.DataFrame, list[int]]:
+    secret = SHEET_CONFIG[file_label]["secret_key"]
+    df = load_sheet(secret, tab)
+    df = preprocess(df, file_label)
+    df, interp = interpolate_years(df, target_years)
+    return df, interp
+
+# ─────────────────────────────────────────────────────────────
+# 12. AI 분석 프롬프트
+# ─────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """당신은 KTDB 전문 분석가입니다. 규칙을 엄격히 따르세요.
+
+[출력 규칙]
+1. 설명은 2~3줄 이내 핵심 요약만 작성.
+2. 표 헤더는 한글 공식 용어 사용(시도, 시군구, 존번호, 총 인구수, 출근, 승용차 등).
+3. 표는 존번호(또는 발생존) 오름차순 정렬.
+4. 단위를 표 상단이나 헤더에 반드시 표기.
+5. 보간 연도가 있으면 해당 열 헤더에 *(보간) 주석 추가.
+6. 행정구역(시도·시군구·존번호) 컬럼은 고정, 나머지는 질문 내용에 따라 구성.
+7. 연도별 비교 요청 시: 상위 헤더=항목명, 하위 헤더=연도 / 항목별 비교 요청 시: 상위 헤더=연도, 하위 헤더=항목명.
+8. 실제 데이터에 없는 수치를 절대 만들어내지 마세요.
+9. 출력: 요약 텍스트 → CSV 블록(```csv ... ```) 순.
+"""
+
+# ─────────────────────────────────────────────────────────────
+# 13. 기존 대화 렌더링
+# ─────────────────────────────────────────────────────────────
+st.title("🚦 KTDB 통합 분석 에이전트")
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-        if "df" in msg: st.dataframe(msg["df"], use_container_width=True)
+        if "df" in msg:
+            df_show = msg["df"].T if st.session_state.transpose else msg["df"]
+            st.dataframe(df_show, use_container_width=True)
+            # 복사 버튼
+            csv_str = msg["df"].to_csv(index=False, encoding="utf-8-sig")
+            st.download_button("📋 표 복사 (CSV 다운로드)",
+                               data=csv_str,
+                               file_name="ktdb_result.csv",
+                               mime="text/csv",
+                               key=f"dl_{id(msg)}")
 
-# 4. 통합 질문 처리
-if user_input := st.chat_input("인구, 종사자 또는 수단별 OD에 대해 질문하세요..."):
+# ─────────────────────────────────────────────────────────────
+# 14. 전치(행열 변환) 토글
+# ─────────────────────────────────────────────────────────────
+if any("df" in m for m in st.session_state.messages):
+    st.session_state.transpose = st.toggle(
+        "↔️ 행·열 전환", value=st.session_state.transpose
+    )
+
+# ─────────────────────────────────────────────────────────────
+# 15. 질문 처리
+# ─────────────────────────────────────────────────────────────
+if user_input := st.chat_input("질문을 입력하세요 — 예: 경기도 2030년 인구수와 종사자수 비교"):
     st.session_state.messages.append({"role": "user", "content": user_input})
-    with st.chat_message("user"): st.markdown(user_input)
+    with st.chat_message("user"):
+        st.markdown(user_input)
 
     with st.chat_message("assistant"):
-        with st.spinner("통합 시트를 검색하여 데이터를 로드 중입니다..."):
-            try:
-                df, used_tab = fetch_ktdb_integrated_data(user_input)
-                
-                # 전처리 (지역 필터링 및 정렬)
-                working_df = df.copy()
-                
-                # SIDO 필터 (사회경제지표용)
-                if 'SIDO' in working_df.columns and sido_select != "전체":
-                    working_df = working_df[working_df['SIDO'].astype(str).str.contains(sido_select, na=False)]
-                
-                # ZONE 정렬 (사회경제지표)
-                if 'ZONE' in working_df.columns:
-                    working_df['ZONE'] = pd.to_numeric(working_df['ZONE'], errors='coerce')
-                    working_df = working_df.sort_values(by='ZONE').dropna(subset=['ZONE'])
-                
-                # ORGN 정렬 (OD 데이터용)
-                elif 'ORGN' in working_df.columns:
-                    working_df['ORGN'] = pd.to_numeric(working_df['ORGN'], errors='coerce')
-                    working_df = working_df.sort_values(by='ORGN').dropna(subset=['ORGN'])
 
-                # AI 프롬프트 구성
-                data_sample = working_df.head(100).to_string(index=False)
-                prompt = f"{SCHEMA_RULES}\n\n[실제 데이터 (탭: {used_tab})]\n컬럼: {list(working_df.columns)}\n데이터내용:\n{data_sample}\n\n질문: {user_input}"
-                
-                response = model.generate_content(prompt)
-                
-                # 결과 출력
-                summary = response.text.split("```csv")[0]
-                st.markdown(summary)
-                
-                new_msg = {"role": "assistant", "content": summary}
-                if "```csv" in response.text:
-                    csv_raw = response.text.split("```csv")[1].split("```")[0].strip()
-                    res_df = pd.read_csv(io.StringIO(csv_raw))
-                    st.dataframe(res_df, use_container_width=True)
-                    new_msg["df"] = res_df
-                
-                st.session_state.messages.append(new_msg)
-                
+        # ① AI 탭 라우팅
+        with st.spinner("AI가 적합한 시트를 선택 중..."):
+            ai_file, ai_tab = ai_route(user_input)
+            # 사이드바 상태 갱신
+            st.session_state.sel_file = ai_file
+            st.session_state.sel_tab  = ai_tab
+
+        tab_kr = SHEET_CONFIG[ai_file]["tabs"].get(ai_tab, ai_tab)
+        st.caption(f"📂 선택된 시트: **{ai_file}** > **{tab_kr}**")
+
+        # ② 연도 결정
+        target_years = get_user_years()
+
+        # ③ 데이터 로드 & 전처리
+        with st.spinner(f"`{ai_tab}` 데이터 로딩 중..."):
+            try:
+                df, interp_years = load_integrated(ai_file, ai_tab, target_years)
             except Exception as e:
-                st.error(f"❌ 통합 분석 오류: {e}")
+                st.error(f"❌ 데이터 로드 실패: {e}")
+                st.stop()
+
+        unit = UNITS.get(ai_file, "")
+        interp_note = f"\n※ 보간 연도: {interp_years} (선형보간법 적용)" if interp_years else ""
+
+        # ④ AI 분석
+        data_sample = df.head(150).to_string(index=False)
+        prompt = (
+            f"{SYSTEM_PROMPT}\n\n"
+            f"[데이터 정보]\n"
+            f"파일: {ai_file} / 시트: {tab_kr} / 단위: {unit}{interp_note}\n"
+            f"컬럼: {list(df.columns)}\n"
+            f"데이터(최대 150행):\n{data_sample}\n\n"
+            f"[질문]\n{user_input}"
+        )
+
+        with st.spinner("보고서 작성 중..."):
+            response = model.generate_content(prompt)
+
+        full_text = response.text
+
+        # ⑤ 요약 텍스트 출력
+        summary = full_text.split("```csv")[0].strip()
+        st.markdown(summary)
+
+        # ⑥ CSV 파싱 및 표 출력
+        new_msg = {"role": "assistant", "content": summary}
+
+        if "```csv" in full_text:
+            csv_raw = full_text.split("```csv")[1].split("```")[0].strip()
+            try:
+                res_df = pd.read_csv(io.StringIO(csv_raw))
+
+                # 행열 전환 토글 반영
+                df_show = res_df.T if st.session_state.transpose else res_df
+                st.dataframe(df_show, use_container_width=True)
+
+                # 다운로드 버튼
+                csv_dl = res_df.to_csv(index=False, encoding="utf-8-sig")
+                st.download_button("📋 표 복사 (CSV 다운로드)",
+                                   data=csv_dl,
+                                   file_name="ktdb_result.csv",
+                                   mime="text/csv")
+
+                new_msg["df"] = res_df
+            except Exception:
+                st.warning("CSV 파싱 실패 — 텍스트 결과만 표시합니다.")
+
+        st.session_state.messages.append(new_msg)
