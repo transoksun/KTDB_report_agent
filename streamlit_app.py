@@ -9,7 +9,7 @@ import json
 # ─────────────────────────────────────────────────────────────
 # 1. 페이지 설정
 # ─────────────────────────────────────────────────────────────
-st.set_page_config(page_title="KTDB 통합 분석 에이전트", layout="wide")
+st.set_page_config(page_title="KTDB 통합 분석 에이전트 v2", layout="wide")
 
 st.markdown("""
 <style>
@@ -24,9 +24,23 @@ thead tr th { background: #f0f2f6; font-weight: 600; }
 @st.cache_resource
 def init_model():
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    models = [m.name for m in genai.list_models()
-              if 'generateContent' in m.supported_generation_methods]
-    name = next((m for m in models if "1.5-flash" in m), models[0])
+    models = [
+        m.name for m in genai.list_models()
+        if 'generateContent' in m.supported_generation_methods
+    ]
+    
+    # 우선순위 순서로 모델 탐색
+    preferred = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
+    name = None
+    for pref in preferred:
+        found = next((m for m in models if pref in m), None)
+        if found:
+            name = found
+            break
+    if not name:
+        name = models[0]  # 그래도 없으면 첫 번째
+
+    st.sidebar.caption(f"🤖 AI 모델: `{name}`")
     return genai.GenerativeModel(name)
 
 try:
@@ -36,18 +50,16 @@ except Exception as e:
     st.stop()
 
 # ─────────────────────────────────────────────────────────────
-# 3. gspread 연결 (private_key 줄바꿈 안전 처리 포함)
+# 3. gspread 연결
 # ─────────────────────────────────────────────────────────────
 @st.cache_resource
 def init_gspread():
-    """service_account 방식으로 gspread 클라이언트 초기화"""
     scope = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
     ]
     info = dict(st.secrets["gcp_service_account"])
     info["private_key"] = info["private_key"].replace("\\n", "\n")
-
     try:
         creds = Credentials.from_service_account_info(info, scopes=scope)
         return gspread.authorize(creds)
@@ -125,7 +137,30 @@ def load_sheet(spreadsheet_url: str, tab_name: str) -> pd.DataFrame:
     return df
 
 # ─────────────────────────────────────────────────────────────
-# 6. 시군구 목록 동적 로드
+# 6. ★ ZONE 기준표 로드 (모든 정렬의 기준)
+#    ZONE 시트: 존번호 → 시도, 시군구 매핑
+#    이 순서가 모든 데이터의 정렬 기준이 됨
+# ─────────────────────────────────────────────────────────────
+@st.cache_data(ttl=600, show_spinner=False)
+def load_zone_master() -> pd.DataFrame:
+    """
+    ZONE 시트를 로드해서 기준표로 반환
+    컬럼: ZONE(존번호), SIDO(시도), SIGU(시군구)
+    존번호 오름차순으로 정렬 — 이게 모든 결과의 정렬 기준
+    """
+    try:
+        url = st.secrets["SHEET_URL_SOCIO"]
+        df  = load_sheet(url, "ZONE")
+        df["ZONE"] = pd.to_numeric(df["ZONE"], errors="coerce")
+        df = df.sort_values("ZONE").dropna(subset=["ZONE"])
+        df["ZONE"] = df["ZONE"].astype(int)
+        return df[["ZONE", "SIDO", "SIGU"]].reset_index(drop=True)
+    except Exception as e:
+        st.warning(f"ZONE 기준표 로드 실패: {e}")
+        return pd.DataFrame(columns=["ZONE", "SIDO", "SIGU"])
+
+# ─────────────────────────────────────────────────────────────
+# 7. 시군구 목록 동적 로드 (ZONE 기준표 활용)
 # ─────────────────────────────────────────────────────────────
 SIDO_LIST = [
     "전체", "서울특별시", "부산광역시", "대구광역시", "인천광역시",
@@ -137,16 +172,19 @@ SIDO_LIST = [
 @st.cache_data(ttl=600, show_spinner=False)
 def get_sigu_list(sido: str) -> list:
     try:
-        url = st.secrets["SHEET_URL_SOCIO"]
-        df  = load_sheet(url, "ZONE")
+        zone_master = load_zone_master()
         if sido != "전체":
-            df = df[df["SIDO"].astype(str).str.contains(sido, na=False)]
-        return ["전체"] + sorted(df["SIGU"].dropna().unique().tolist())
+            zone_master = zone_master[
+                zone_master["SIDO"].astype(str).str.contains(sido, na=False)
+            ]
+        # ★ 존번호 순서 그대로 시군구 목록 생성 (가나다순 아님)
+        sigu_list = zone_master["SIGU"].dropna().unique().tolist()
+        return ["전체"] + sigu_list
     except Exception:
         return ["전체"]
 
 # ─────────────────────────────────────────────────────────────
-# 7. 세션 상태 초기화
+# 8. 세션 상태 초기화
 # ─────────────────────────────────────────────────────────────
 for key, default in {
     "messages":    [],
@@ -159,7 +197,7 @@ for key, default in {
         st.session_state[key] = default
 
 # ─────────────────────────────────────────────────────────────
-# 8. 사이드바
+# 9. 사이드바
 # ─────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚙️ 분석 조건")
@@ -238,7 +276,7 @@ with st.sidebar:
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────
-# 9. AI 탭 자동 선택
+# 10. AI 탭 자동 선택
 # ─────────────────────────────────────────────────────────────
 def ai_route(query: str) -> tuple[str, str]:
     registry = {fname: list(cfg["tabs"].keys()) for fname, cfg in SHEET_CONFIG.items()}
@@ -266,26 +304,37 @@ JSON 외 어떤 텍스트도 출력하지 마세요.
     return fallback_file, fallback_tab
 
 # ─────────────────────────────────────────────────────────────
-# 10. 전처리
+# 11. 전처리
 # ─────────────────────────────────────────────────────────────
 def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+
+    # 숫자형 변환 (콤마 제거 포함)
     for col in df.columns:
         if col not in ("SIDO", "SIGU"):
-            df[col] = pd.to_numeric(df[col], errors="ignore")
+            cleaned   = df[col].astype(str).str.replace(",", "", regex=False)
+            converted = pd.to_numeric(cleaned, errors="coerce")
+            if converted.notna().any():
+                df[col] = converted
+
+    # 지역 필터
     if "SIDO" in df.columns and sido_sel != "전체":
         df = df[df["SIDO"].astype(str).str.contains(sido_sel, na=False)]
     if "SIGU" in df.columns and sigu_sel != "전체":
         df = df[df["SIGU"].astype(str).str.contains(sigu_sel, na=False)]
+
+    # ★ 존번호(ZONE) 또는 발생존(ORGN) 기준 오름차순 정렬
     sort_col = next((c for c in ["ZONE", "ORGN"] if c in df.columns), None)
     if sort_col:
         df[sort_col] = pd.to_numeric(df[sort_col], errors="coerce")
-        df = df.sort_values(sort_col).dropna(subset=[sort_col])
+        df = df.sort_values(sort_col, ascending=True).dropna(subset=[sort_col])
+
+    # 컬럼 한글화
     df.rename(columns={c: COL_KR.get(c, c) for c in df.columns}, inplace=True)
     return df
 
 # ─────────────────────────────────────────────────────────────
-# 11. 보간법
+# 12. 보간법
 # ─────────────────────────────────────────────────────────────
 DIST_YEARS = [int(y) for y in YEARS]
 
@@ -321,7 +370,7 @@ def interpolate_years(df: pd.DataFrame, target_years: list[int]) -> tuple[pd.Dat
     return df, interp_years
 
 # ─────────────────────────────────────────────────────────────
-# 12. 통합 로드
+# 13. 통합 로드
 # ─────────────────────────────────────────────────────────────
 def load_integrated(file_label: str, tab: str,
                     target_years: list[int]) -> tuple[pd.DataFrame, list[int]]:
@@ -332,24 +381,79 @@ def load_integrated(file_label: str, tab: str,
     return df, interp
 
 # ─────────────────────────────────────────────────────────────
-# 13. AI 분석 프롬프트 규칙
+# 14. 질문 의도 분석 — 집계 단위 판단
+# ─────────────────────────────────────────────────────────────
+def needs_aggregation(query: str) -> str:
+    sido_keywords = ["시도별", "시도 별", "광역시", "도별", "전국 시도", "시도 합계", "시도 인구"]
+    sigu_keywords = ["시군구별", "시군구 별", "구별", "군별", "시별"]
+    if any(k in query for k in sido_keywords):
+        return "sido"
+    elif any(k in query for k in sigu_keywords):
+        return "sigu"
+    else:
+        return "zone"
+
+# ─────────────────────────────────────────────────────────────
+# 15. ★ 집계 함수 — ZONE 기준표 순서로 정렬
+#    집계 후 존번호가 사라져도 ZONE 시트의 시도/시군구 등장 순서를 따름
+# ─────────────────────────────────────────────────────────────
+def aggregate_df(df: pd.DataFrame, agg_level: str) -> pd.DataFrame:
+    zone_master = load_zone_master()  # ZONE 기준표 (존번호 오름차순)
+    num_cols    = [c for c in df.columns if c not in ("시도", "시군구", "존번호")]
+
+    if agg_level == "sido" and "시도" in df.columns:
+        # pandas로 시도별 합산
+        result = df.groupby("시도")[num_cols].sum().reset_index()
+
+        # ★ ZONE 기준표에서 시도별 첫 번째 존번호를 추출 → 그 순서로 정렬
+        sido_order = (
+            zone_master.rename(columns={"SIDO": "시도"})
+            .drop_duplicates(subset="시도", keep="first")  # 시도별 첫 존번호
+            [["시도", "ZONE"]]
+        )
+        result = result.merge(sido_order, on="시도", how="left")
+        result = result.sort_values("ZONE", ascending=True).drop(columns=["ZONE"])
+        return result.reset_index(drop=True)
+
+    elif agg_level == "sigu" and "시군구" in df.columns:
+        # pandas로 시군구별 합산
+        group_cols = [c for c in ["시도", "시군구"] if c in df.columns]
+        result = df.groupby(group_cols)[num_cols].sum().reset_index()
+
+        # ★ ZONE 기준표에서 시군구별 첫 번째 존번호를 추출 → 그 순서로 정렬
+        sigu_order = (
+            zone_master.rename(columns={"SIDO": "시도", "SIGU": "시군구"})
+            .drop_duplicates(subset="시군구", keep="first")
+            [["시군구", "ZONE"]]
+        )
+        result = result.merge(sigu_order, on="시군구", how="left")
+        result = result.sort_values("ZONE", ascending=True).drop(columns=["ZONE"])
+        return result.reset_index(drop=True)
+
+    else:
+        # 존 단위 — 존번호 오름차순 (preprocess에서 이미 정렬됨)
+        return df
+
+# ─────────────────────────────────────────────────────────────
+# 16. AI 분석 프롬프트 규칙
 # ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """당신은 KTDB 전문 분석가입니다. 아래 규칙을 엄격히 따르세요.
 
 [출력 규칙]
 1. 설명은 2~3줄 이내 핵심 요약만 작성.
 2. 표 헤더는 한글 공식 용어 사용(시도, 시군구, 존번호, 총 인구수, 출근, 승용차 등).
-3. 표는 존번호(또는 발생존) 오름차순 정렬.
+3. ⚠️ 데이터 순서를 절대 바꾸지 마세요. 제공된 순서 그대로 표에 옮기세요.
 4. 단위를 표 상단이나 헤더에 반드시 표기.
 5. 보간 연도가 있으면 해당 열 헤더에 *(보간) 주석 추가.
 6. 행정구역(시도·시군구·존번호) 컬럼은 고정, 나머지는 질문에 따라 구성.
 7. 연도별 비교: 상위 헤더=항목명, 하위 헤더=연도 / 항목별 비교: 상위 헤더=연도, 하위 헤더=항목명.
-8. 실제 데이터에 없는 수치를 절대 만들어내지 마세요.
-9. 출력 형식: 요약 텍스트 → CSV 블록(```csv ... ```) 순.
+8. ⚠️ 제공된 숫자를 절대 수정·재계산·반올림하지 마세요. 받은 숫자를 그대로 표에 옮기세요.
+9. 실제 데이터에 없는 수치를 절대 만들어내지 마세요.
+10. 출력 형식: 요약 텍스트 → CSV 블록(```csv ... ```) 순.
 """
 
 # ─────────────────────────────────────────────────────────────
-# 14. 기존 대화 렌더링
+# 17. 기존 대화 렌더링
 # ─────────────────────────────────────────────────────────────
 st.title("🚦 KTDB 통합 분석 에이전트")
 
@@ -374,9 +478,9 @@ if any("df" in m for m in st.session_state.messages):
     )
 
 # ─────────────────────────────────────────────────────────────
-# 15. 질문 처리
+# 18. 질문 처리
 # ─────────────────────────────────────────────────────────────
-if user_input := st.chat_input("질문을 입력하세요 — 예: 경기도 2030년 인구수와 종사자수 비교"):
+if user_input := st.chat_input("질문을 입력하세요 — 예: 시도별 2023년 인구수 비교"):
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
@@ -411,23 +515,37 @@ if user_input := st.chat_input("질문을 입력하세요 — 예: 경기도 203
                 st.error(f"❌ 데이터 로드 실패: {e}")
                 st.stop()
 
+        # ④ 집계 — pandas가 직접 계산, ZONE 기준표 순서로 정렬
+        agg_level = needs_aggregation(user_input)
+        if ai_file == "사회경제지표":
+            agg_df   = aggregate_df(df, agg_level)
+            agg_note = {"sido": "시도별 합산", "sigu": "시군구별 합산", "zone": "존 단위"}.get(agg_level, "")
+        else:
+            # OD 데이터 — 발생존(ORGN) 기준 존번호 순서 유지
+            if "발생존" in df.columns:
+                df = df.sort_values("발생존", ascending=True).reset_index(drop=True)
+            agg_df   = df
+            agg_note = ""
+
         unit        = UNITS.get(ai_file, "")
         interp_note = (
             f"\n※ 보간 연도: {interp_years} (선형보간법 적용)"
             if interp_years else ""
         )
 
-        # ④ AI 분석
-        data_sample = df.head(150).to_string(index=False)
+        # ⑤ AI에게 집계·정렬 완료된 데이터 전달
+        data_sample = agg_df.to_string(index=False)
         prompt = (
             f"{SYSTEM_PROMPT}\n\n"
-            f"[데이터 정보]\n"
-            f"파일: {ai_file} / 시트: {tab_kr} / 단위: {unit}{interp_note}\n"
-            f"컬럼: {list(df.columns)}\n"
-            f"데이터(최대 150행):\n{data_sample}\n\n"
+            f"[집계·정렬 완료 데이터 — 숫자와 순서를 절대 바꾸지 마세요]\n"
+            f"파일: {ai_file} / 시트: {tab_kr} / 단위: {unit}"
+            f"{f' / 집계: {agg_note}' if agg_note else ''}{interp_note}\n"
+            f"컬럼: {list(agg_df.columns)}\n"
+            f"아래 데이터를 순서 그대로 표로 옮기고 요약 텍스트만 작성하세요:\n{data_sample}\n\n"
             f"[질문]\n{user_input}"
         )
 
+        # ⑥ AI 분석
         with st.spinner("보고서 작성 중..."):
             response = model.generate_content(prompt)
 
@@ -440,10 +558,45 @@ if user_input := st.chat_input("질문을 입력하세요 — 예: 경기도 203
         if "```csv" in full_text:
             csv_raw = full_text.split("```csv")[1].split("```")[0].strip()
             try:
-                res_df  = pd.read_csv(io.StringIO(csv_raw))
+                res_df = pd.read_csv(io.StringIO(csv_raw))
+
+                # ★ CSV 파싱 후 ZONE 기준표 순서로 재정렬 (AI가 순서 바꿨을 경우 대비)
+                zone_master = load_zone_master()
+                if "존번호" in res_df.columns:
+                    # 존 단위: 존번호 오름차순
+                    res_df["존번호"] = pd.to_numeric(res_df["존번호"], errors="coerce")
+                    res_df = res_df.sort_values("존번호", ascending=True).reset_index(drop=True)
+
+                elif "시도" in res_df.columns and "시군구" not in res_df.columns:
+                    # 시도 집계: ZONE 기준표의 시도 첫 등장 순서
+                    sido_order = (
+                        zone_master.rename(columns={"SIDO": "시도"})
+                        .drop_duplicates(subset="시도", keep="first")
+                        [["시도", "ZONE"]]
+                    )
+                    res_df = res_df.merge(sido_order, on="시도", how="left")
+                    res_df = res_df.sort_values("ZONE", ascending=True).drop(columns=["ZONE"])
+                    res_df = res_df.reset_index(drop=True)
+
+                elif "시군구" in res_df.columns:
+                    # 시군구 집계: ZONE 기준표의 시군구 첫 등장 순서
+                    sigu_order = (
+                        zone_master.rename(columns={"SIGU": "시군구"})
+                        .drop_duplicates(subset="시군구", keep="first")
+                        [["시군구", "ZONE"]]
+                    )
+                    res_df = res_df.merge(sigu_order, on="시군구", how="left")
+                    res_df = res_df.sort_values("ZONE", ascending=True).drop(columns=["ZONE"])
+                    res_df = res_df.reset_index(drop=True)
+
+                elif "발생존" in res_df.columns:
+                    # OD 데이터: 발생존 오름차순
+                    res_df["발생존"] = pd.to_numeric(res_df["발생존"], errors="coerce")
+                    res_df = res_df.sort_values("발생존", ascending=True).reset_index(drop=True)
+
                 df_show = res_df.T if st.session_state.transpose else res_df
                 st.dataframe(df_show, use_container_width=True)
-                csv_dl  = res_df.to_csv(index=False, encoding="utf-8-sig")
+                csv_dl = res_df.to_csv(index=False, encoding="utf-8-sig")
                 st.download_button(
                     "📋 CSV 다운로드",
                     data=csv_dl,
